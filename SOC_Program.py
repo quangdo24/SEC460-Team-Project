@@ -1,4 +1,11 @@
 import json
+import os
+import argparse
+
+import ipaddress
+import sys
+from pathlib import Path
+
 import requests
 from requests.auth import HTTPBasicAuth
 import urllib3
@@ -6,10 +13,143 @@ import urllib3
 # Suppress SSL warnings if your ELK uses self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+BANNER = r"""
+  _  ___ _                                    _    ____  _   _ ____  _____ ___ ____  ____  ____   
+ | |/ (_) |__   __ _ _ __   __ _     _       / \  | __ )| | | / ___|| ____|_ _|  _ \|  _ \| __ )  
+ | ' /| | '_ \ / _` | '_ \ / _` |  _| |_    / _ \ |  _ \| | | \___ \|  _|  | || |_) | | | |  _ \  
+ | . \| | |_) | (_| | | | | (_| | |_   _|  / ___ \| |_) | |_| |___) | |___ | ||  __/| |_| | |_) | 
+ |_|\_\_|_.__/ \__,_|_| |_|\__,_|   |_|   /_/   \_\____/ \___/|____/|_____|___|_|   |____/|____/  
+                                                                                                  
+"""
+
 # --- Configuration ---
 ELASTIC_URL = "https://wa-kibana.cyberrangepoulsbo.com/api/console/proxy?path=/suricata-*/_search&method=POST"
-USER = "username" #enter username here
-PASS = "password" #enter password here
+ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
+ABUSEIPDB_MAX_AGE_DAYS = 90
+
+SECRETS_DIR = Path(__file__).resolve().parent / "secrets"
+WA_KIBANA_CRED_PATH = Path(
+    os.getenv("WA_KIBANA_CRED_PATH", SECRETS_DIR / "wa_kibana.json")
+)
+ABUSEIPDB_KEY_PATH = Path(
+    os.getenv("ABUSEIPDB_KEY_PATH", SECRETS_DIR / "abuseipdb.json")
+)
+
+DEBUG_PRINT_KIBANA_REQUEST = os.getenv("DEBUG_PRINT_KIBANA_REQUEST", "0") == "1"
+
+
+def load_json_file(path: Path, required_keys: set, example_name: str):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing secrets file: {path}. "
+            f"Create it from secrets/{example_name}."
+        )
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    missing = required_keys - set(data.keys())
+    if missing:
+        raise ValueError(f"Missing keys in {path}: {', '.join(sorted(missing))}")
+    return data
+
+
+def print_kibana_request(url: str, headers: dict, payload: dict, username: str):
+    """
+    Pretty-print the Kibana request for debugging without leaking secrets.
+    """
+    print("\n=== Kibana Request (sanitized) ===")
+    print(f"URL: {url}")
+    print(f"Auth: Basic (username={username}, password=<redacted>)")
+    print("Headers:")
+    print(json.dumps(headers, indent=2, sort_keys=True))
+    print("JSON Body:")
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    print("=== End Kibana Request ===\n")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Query Suricata alerts from Kibana/Elasticsearch and check IPs via AbuseIPDB, "
+            "or manually check IPs in AbuseIPDB."
+        )
+    )
+    parser.add_argument(
+        "--ip",
+        action="append",
+        default=[],
+        help=(
+            "Manually check an IP in AbuseIPDB (skips Kibana query). "
+            "Can be repeated, or pass comma-separated values."
+        ),
+    )
+    parser.add_argument(
+        "--max-age-days",
+        type=int,
+        default=ABUSEIPDB_MAX_AGE_DAYS,
+        help="AbuseIPDB maxAgeInDays parameter (default: 90).",
+    )
+    parser.add_argument(
+        "--abuse-verbose",
+        action="store_true",
+        help="Request verbose AbuseIPDB output (includes extra fields when available).",
+    )
+    return parser.parse_args()
+
+
+def normalize_ips(ip_args):
+    raw = []
+    for item in ip_args or []:
+        raw.extend([x.strip() for x in str(item).split(",") if x.strip()])
+
+    ips = []
+    for ip_str in raw:
+        try:
+            ips.append(str(ipaddress.ip_address(ip_str)))
+        except ValueError:
+            print(f"[!] Skipping invalid IP: {ip_str}")
+
+    # de-dupe while preserving order
+    return list(dict.fromkeys(ips))
+
+
+def prompt_user_mode_and_inputs(default_max_age_days: int):
+    """
+    Interactive prompt to choose between:
+    1) Kibana query mode
+    2) Manual AbuseIPDB IP lookup mode
+
+    Returns: (mode, manual_ips, max_age_days)
+      - mode: "kibana" or "manual"
+    """
+    print("\nSelect mode:")
+    print("  1) Query Kibana / Elasticsearch (then check IPs in AbuseIPDB)")
+    print("  2) Manual AbuseIPDB lookup (enter IP address(es))")
+
+    while True:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice in {"1", "2"}:
+            break
+        print("[!] Please enter 1 or 2.")
+
+    if choice == "1":
+        return "kibana", [], default_max_age_days
+
+    ip_text = input("Enter IP(s) (comma-separated): ").strip()
+    manual_ips = normalize_ips([ip_text])
+
+    max_age_text = input(
+        f"Max age in days for AbuseIPDB? (default {default_max_age_days}): "
+    ).strip()
+    if max_age_text:
+        try:
+            max_age_days = int(max_age_text)
+        except ValueError:
+            print("[!] Invalid number, using default.")
+            max_age_days = default_max_age_days
+    else:
+        max_age_days = default_max_age_days
+
+    return "manual", manual_ips, max_age_days
 
 # Your Exact Postman JSON Body
 query_payload = {
@@ -35,17 +175,22 @@ query_payload = {
   "sort": [ { "@timestamp": { "order": "desc" } } ]
 }
 
-def get_suricata_logs():
+def get_suricata_logs(username: str, password: str):
     try:
         headers = {
             "kbn-xsrf": "true",
             "Content-Type": "application/json",
         }
+
+        print("[*] Querying Kibana / Elasticsearch for latest Suricata alerts...")
+        if DEBUG_PRINT_KIBANA_REQUEST:
+            print_kibana_request(ELASTIC_URL, headers, query_payload, username)
+
         # Mimicking Postman POST request with Basic Auth
         response = requests.post(
             ELASTIC_URL,
             json=query_payload,
-            auth=HTTPBasicAuth(USER, PASS),
+            auth=HTTPBasicAuth(username, password),
             headers=headers,
             verify=False # Equivalent to turning off SSL verification in Postman
         )
@@ -62,10 +207,227 @@ def get_suricata_logs():
         print(f"[!] Error: {e}")
         return []
 
-# Execute and view results
-logs = get_suricata_logs()
-if logs:
-    for idx, hit in enumerate(logs, start=1):
+def extract_ips(logs):
+    ips = set()
+    for hit in logs:
         source = hit.get("_source", {})
-        print(f"\n--- Match {idx} ---")
-        print(json.dumps(source, indent=2, sort_keys=True))
+        for field in ("src_ip", "dest_ip"):
+            ip_value = source.get(field)
+            if ip_value:
+                ips.add(ip_value)
+    return sorted(ips)
+
+
+def check_ip_abuse(ip_address: str, api_key: str, max_age_days: int, verbose: bool):
+    headers = {
+        "Key": api_key,
+        "Accept": "application/json",
+    }
+    params = {
+        "ipAddress": ip_address,
+        "maxAgeInDays": max_age_days,
+        "verbose": "true" if verbose else "false",
+    }
+    response = requests.get(ABUSEIPDB_URL, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json().get("data", {})
+
+
+def print_abuseipdb_report(ip_address: str, data: dict):
+    print(f"\n--- AbuseIPDB: {ip_address} ---")
+    location_fields = ["countryName", "countryCode", "region", "city"]
+    for field in location_fields:
+        value = data.get(field)
+        if value:
+            print(f"{field}: {value}")
+
+    fields = [
+        "abuseConfidenceScore",
+        "isp",
+        "domain",
+        "usageType",
+        "totalReports",
+        "lastReportedAt",
+        "isWhitelisted",
+    ]
+    for field in fields:
+        print(f"{field}: {data.get(field)}")
+
+
+def _flatten(obj, prefix=""):
+    """
+    Flatten nested dict/list structures into dotted keys for readable printing.
+    Example: {"a": {"b": 1}} -> {"a.b": 1}
+    """
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            flat.update(_flatten(v, key))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            key = f"{prefix}[{i}]"
+            flat.update(_flatten(v, key))
+    else:
+        flat[prefix] = obj
+    return flat
+
+
+def _bytes_to_gb(value) -> float | None:
+    """
+    Convert bytes to decimal gigabytes (GB, 1 GB = 1,000,000,000 bytes).
+    Returns None if value is not a number.
+    """
+    try:
+        return float(value) / 1_000_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+def print_suricata_hit(idx: int, source: dict):
+    """
+    Nicely print a Suricata/Kibana hit in a readable, non-JSON format.
+    Includes a compact summary plus a full flattened key/value dump.
+    """
+    ts = source.get("@timestamp") or source.get("timestamp")
+    src_ip = source.get("src_ip")
+    dest_ip = source.get("dest_ip")
+    src_port = source.get("src_port")
+    dest_port = source.get("dest_port")
+    proto = source.get("proto")
+    app_proto = source.get("app_proto")
+
+    # Suricata alert fields can appear in different places depending on pipeline
+    alert = source.get("alert") or {}
+    suricata_alert = (
+        (((source.get("suricata") or {}).get("eve") or {}).get("alert")) or {}
+    )
+    signature = (
+        suricata_alert.get("signature")
+        or alert.get("signature")
+        or source.get("suricata.eve.alert.signature")
+    )
+    category = suricata_alert.get("category") or alert.get("category")
+    severity = suricata_alert.get("severity") or alert.get("severity")
+    signature_id = suricata_alert.get("signature_id") or alert.get("signature_id")
+
+    # GeoIP (best effort)
+    geoip = source.get("geoip") or {}
+    src_country = (
+        ((geoip.get("src_country") or {}).get("name"))
+        or ((geoip.get("src_country") or {}).get("iso_code"))
+    )
+    dest_country = (
+        ((geoip.get("dest_country") or {}).get("name"))
+        or ((geoip.get("dest_country") or {}).get("iso_code"))
+    )
+
+    print(f"\n=== Match {idx} ===")
+    print(f"Time: {ts}")
+    print(f"Flow: {src_ip}:{src_port}  ->  {dest_ip}:{dest_port}")
+    print(f"Proto: {proto}   App: {app_proto}")
+    if src_country or dest_country:
+        print(f"Geo: {src_country or '?'}  ->  {dest_country or '?'}")
+    if signature or category or severity is not None:
+        print("Alert:")
+        if signature:
+            print(f"  Signature: {signature}")
+        if signature_id is not None:
+            print(f"  Signature ID: {signature_id}")
+        if category:
+            print(f"  Category: {category}")
+        if severity is not None:
+            print(f"  Severity: {severity}")
+
+    message = source.get("message")
+    if message:
+        print(f"Message: {message}")
+
+    # Full details without JSON formatting
+    print("\nAll fields:")
+    flat = _flatten(source)
+    for key in sorted(flat.keys()):
+        value = flat[key]
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        suffix = ""
+        if (
+            "bytes" in key
+            and isinstance(value, (int, float))
+            and ("flow.bytes_" in key or ".bytes_" in key or key.endswith("bytes"))
+        ):
+            gb = _bytes_to_gb(value)
+            if gb is not None:
+                suffix = f" ({gb:.2f} GB)"
+
+        print(f"- {key} = {value}{suffix}")
+
+
+def main():
+    print(BANNER)
+    args = parse_args()
+    manual_ips = normalize_ips(args.ip)
+
+    # If user provided no CLI flags, prompt interactively (when possible)
+    max_age_days = args.max_age_days
+    abuse_verbose = args.abuse_verbose
+    if not manual_ips and len(sys.argv) == 1 and sys.stdin.isatty():
+        try:
+            mode, manual_ips, max_age_days = prompt_user_mode_and_inputs(
+                ABUSEIPDB_MAX_AGE_DAYS
+            )
+            if mode == "kibana":
+                manual_ips = []
+        except (EOFError, KeyboardInterrupt):
+            print("\n[*] Cancelled.")
+            return
+
+    # Manual AbuseIPDB mode (skips Kibana query)
+    if manual_ips:
+        abuseipdb = load_json_file(
+            ABUSEIPDB_KEY_PATH, {"api_key"}, "abuseipdb.example.json"
+        )
+        print(f"[*] Checking {len(manual_ips)} manual IP(s) against AbuseIPDB...")
+        for ip_address in manual_ips:
+            try:
+                data = check_ip_abuse(
+                    ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
+                )
+                print_abuseipdb_report(ip_address, data)
+            except Exception as exc:
+                print(f"[!] AbuseIPDB error for {ip_address}: {exc}")
+        return
+
+    # Normal mode: Kibana query + AbuseIPDB checks for extracted IPs
+    wa_kibana = load_json_file(
+        WA_KIBANA_CRED_PATH, {"username", "password"}, "wa_kibana.example.json"
+    )
+    abuseipdb = load_json_file(
+        ABUSEIPDB_KEY_PATH, {"api_key"}, "abuseipdb.example.json"
+    )
+
+    logs = get_suricata_logs(wa_kibana["username"], wa_kibana["password"])
+    if logs:
+        for idx, hit in enumerate(logs, start=1):
+            source = hit.get("_source", {})
+            print_suricata_hit(idx, source)
+
+        ips = extract_ips(logs)
+        if ips:
+            print(f"\n[*] Checking {len(ips)} IPs against AbuseIPDB...")
+            for ip_address in ips:
+                try:
+                    data = check_ip_abuse(
+                        ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
+                    )
+                    print_abuseipdb_report(ip_address, data)
+                except Exception as exc:
+                    print(f"[!] AbuseIPDB error for {ip_address}: {exc}")
+        else:
+            print("[*] No IPs found in logs to check.")
+
+
+if __name__ == "__main__":
+    main()
