@@ -1,2 +1,6 @@
+# ignore virtual environment
+venv/
+
+# ignore secrets but allow examples
 secrets/*.json
 !secrets/*.example.json
