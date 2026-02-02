@@ -10,11 +10,15 @@ if command -v python3 -m venv venv >/dev/null 2>&1; then
 	source ./venv/bin/activate
 	if command -v pip3 >/dev/null 2>&1; then
 		echo "Making sure pip3 is up to date..."
-		pip3 install --upgrade >/dev/null
+		pip3 install --upgrade pip >/dev/null
 		echo "Installing prerequisites (1 of 2): requests"
 		pip3 install requests >/dev/null
 		echo "Installing prerequisites (2 of 2): urllib3"
 		pip3 install urllib3 >/dev/null
+
+		echo "A virtual environment has been created at ./venv, containing the necessary packages for the script to function."
+		echo "To enter the virtual environment, run './venv/bin/activate'."
+		echo "To leave the virtual environment, run 'deactivate'."
 	else
 		echo "Couldn't initialize pip3. Is pip installed?"
 	fi
