@@ -19,6 +19,8 @@ from rich.table import Table
 from rich.tree import Tree
 from rich.syntax import Syntax
 from rich.style import Style
+from rich.text import Text
+from rich.markup import escape
 
 # Suppress SSL warnings if your ELK uses self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -136,26 +138,31 @@ def normalize_ips(ip_args):
 def prompt_user_mode_and_inputs():
     """
     Interactive prompt to choose between:
-    1) Kibana query mode
-    2) Manual AbuseIPDB IP lookup mode
+    1) Kibana query mode (all alerts)
+    2) Kibana privilege escalation filter (severity 1 + privilege gain categories)
+    3) Manual AbuseIPDB IP lookup mode
 
     Returns: (mode, manual_ips)
-      - mode: "kibana" or "manual"
+      - mode: "kibana", "kibana_privesc", or "manual"
     """
     console.print("\n[bold]Select mode:[/bold]")
-    console.print("  [cyan]1)[/cyan] Query Kibana / Elasticsearch (then check IPs in AbuseIPDB)")
-    console.print("  [cyan]2)[/cyan] Manual AbuseIPDB lookup (enter IP address(es))")
+    console.print("  [cyan]1)[/cyan] Query Kibana / Elasticsearch (all alerts, then check IPs in AbuseIPDB)")
+    console.print("  [cyan]2)[/cyan] Query Kibana (privilege escalation only: severity 1 + privilege gain)")
+    console.print("  [cyan]3)[/cyan] Manual AbuseIPDB lookup (enter IP address(es))")
 
     while True:
-        choice = console.input("Enter [cyan]1[/cyan] or [cyan]2[/cyan]: ").strip()
-        if choice in {"1", "2"}:
+        choice = console.input("Enter [cyan]1[/cyan], [cyan]2[/cyan], or [cyan]3[/cyan]: ").strip()
+        if choice in {"1", "2", "3"}:
             break
-        console.print("[red][!] Please enter 1 or 2.[/red]")
+        console.print("[red][!] Please enter 1, 2, or 3.[/red]")
 
     if choice == "1":
         return "kibana", []
+    
+    if choice == "2":
+        return "kibana_privesc", []
 
-    # Option 2: force valid IP input so we never accidentally fall through to Kibana mode
+    # Option 3: force valid IP input so we never accidentally fall through to Kibana mode
     while True:
         ip_text = console.input("Enter IP(s) (comma-separated): ").strip()
         manual_ips = normalize_ips([ip_text])
@@ -187,8 +194,33 @@ query_payload = {
   "sort": [ { "@timestamp": { "order": "desc" } } ]
 }
 
-def get_suricata_logs(username: str, password: str):
+# Privilege Escalation Query: severity 1 + specific categories + past 4 hours
+query_payload_privilege_escalation = {
+  "size": 100,
+  "_source": [
+    "alert.signature", "alert.category", "src_ip", "dest_ip", "dest_port", "alert.severity",
+    "clientID", "agent.name", "@timestamp", "timestamp"
+  ],
+  "query": {
+    "bool": {
+      "must": [
+        { "range": { "@timestamp": { "gte": "now-4h" } } },
+        { "term": { "alert.severity": 1 } },
+        { "terms": { "alert.category": [
+          "Attempted Administrator Privilege Gain",
+          "Attempted User Privilege Gain"
+        ]}}
+      ]
+    }
+  },
+  "sort": [ { "@timestamp": { "order": "desc" } } ]
+}
+
+def get_suricata_logs(username: str, password: str, payload=None):
     """Query Kibana/Elasticsearch for the latest Suricata alert hits and return the hits list."""
+    if payload is None:
+        payload = query_payload
+    
     try:
         headers = {
             "kbn-xsrf": "true",
@@ -197,11 +229,11 @@ def get_suricata_logs(username: str, password: str):
 
         console.print("[*] Querying Kibana / Elasticsearch for latest Suricata alerts...")
         if DEBUG_PRINT_KIBANA_REQUEST:
-            print_kibana_request(ELASTIC_URL, headers, query_payload, username)
+            print_kibana_request(ELASTIC_URL, headers, payload, username)
 
         response = requests.post(
             ELASTIC_URL,
-            json=query_payload,
+            json=payload,
             auth=HTTPBasicAuth(username, password),
             headers=headers,
             verify=False
@@ -282,7 +314,7 @@ def print_abuseipdb_report(ip_address: str, data: dict, match_indices=None):
     # Core Fields
     score = data.get("abuseConfidenceScore", 0)
     score_style = get_abuse_score_style(score)
-    table.add_row("Abuse Score:", f"[{score_style.color}]{score}[/{score_style.color}]", style=score_style)
+    table.add_row("Abuse Score:", str(score), style=score_style)
     table.add_row("ISP:", data.get("isp", "N/A"))
     table.add_row("Domain:", data.get("domain", "N/A"))
     table.add_row("Usage Type:", data.get("usageType", "N/A"))
@@ -309,6 +341,39 @@ def add_to_tree(tree: Tree, data: Any, key: str = "data"):
             add_to_tree(branch, v, f"[{i}]")
     else:
         tree.add(f"[bold green]{key}[/bold green]: [default]{data!r}[/default]")
+
+
+def print_privesc_hit(idx: int, source: dict):
+    """
+    Print a simplified privilege escalation alert with only key fields.
+    """
+    alert = source.get("alert") or {}
+    signature = alert.get("signature", "N/A")
+    severity = alert.get("severity", "N/A")
+    src_ip = source.get("src_ip", "N/A")
+    dest_ip = source.get("dest_ip", "N/A")
+    dest_port = source.get("dest_port", "N/A")
+    client_id = source.get("clientID", "N/A")
+    agent_name = source.get("agent", {}).get("name", "N/A")
+    
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="bold cyan", width=20)
+    table.add_column()
+    
+    table.add_row("Alert Signature:", str(signature))
+    table.add_row("Source IP:", str(src_ip))
+    table.add_row("Dest IP:", str(dest_ip))
+    table.add_row("Dest Port:", str(dest_port))
+    table.add_row("Severity:", str(severity))
+    table.add_row("Client ID:", str(client_id))
+    table.add_row("Agent Name:", str(agent_name))
+    
+    console.print(Panel(
+        table,
+        title=f"[bold]Privilege Escalation Alert #{idx}[/bold]",
+        border_style="red",
+        expand=False
+    ))
 
 
 def print_suricata_hit(idx: int, source: dict):
@@ -379,13 +444,15 @@ def main():
     args = parse_args()
     manual_ips = normalize_ips(args.ip)
 
+    kibana_mode = None
     max_age_days = args.max_age_days
     abuse_verbose = args.abuse_verbose
     if not manual_ips and len(sys.argv) == 1 and sys.stdin.isatty():
         try:
             mode, manual_ips = prompt_user_mode_and_inputs()
             max_age_days = ABUSEIPDB_MAX_AGE_DAYS
-            if mode == "kibana":
+            if mode in {"kibana", "kibana_privesc"}:
+                kibana_mode = mode
                 manual_ips = []
         except (EOFError, KeyboardInterrupt):
             console.print("\n[*] Cancelled.")
@@ -404,7 +471,7 @@ def main():
                 )
                 print_abuseipdb_report(ip_address, data)
             except Exception as exc:
-                console.print(f"[red][!] AbuseIPDB error for {ip_address}: {exc}[/red]")
+                console.print(f"[red][!] AbuseIPDB error for {ip_address}: {escape(str(exc))}[/red]")
         return
 
     # Normal mode: Kibana query + AbuseIPDB
@@ -415,7 +482,9 @@ def main():
         ABUSEIPDB_KEY_PATH, {"api_key"}, "abuseipdb.example.json"
     )
 
-    logs = get_suricata_logs(wa_kibana["username"], wa_kibana["password"])
+    # Select query payload based on mode
+    payload = query_payload_privilege_escalation if kibana_mode == "kibana_privesc" else query_payload
+    logs = get_suricata_logs(wa_kibana["username"], wa_kibana["password"], payload)
     if not logs:
         return
 
@@ -423,27 +492,33 @@ def main():
     ip_to_matches = {}
     for idx, hit in enumerate(logs, start=1):
         source = hit.get("_source", {})
-        print_suricata_hit(idx, source)
+        if kibana_mode == "kibana_privesc":
+            print_privesc_hit(idx, source)
+        else:
+            print_suricata_hit(idx, source)
         src_ip = source.get("src_ip")
         if src_ip:
             ip_to_matches.setdefault(src_ip, []).append(idx)
 
-    # Check extracted IPs against AbuseIPDB
-    ips = extract_ips(logs)
-    if ips:
-        console.print(f"\n[*] Checking [bold green]{len(ips)}[/bold green] IPs against AbuseIPDB...")
-        for ip_address in ips:
-            try:
-                data = check_ip_abuse(
-                    ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
-                )
-                print_abuseipdb_report(
-                    ip_address, data, match_indices=ip_to_matches.get(ip_address)
-                )
-            except Exception as exc:
-                console.print(f"[red][!] AbuseIPDB error for {ip_address}: {exc}[/red]")
+    # Check extracted IPs against AbuseIPDB (skip for privilege escalation mode with internal IPs)
+    if kibana_mode == "kibana_privesc":
+        console.print("\n[*] Skipping AbuseIPDB check for privilege escalation mode (typically internal IPs).")
     else:
-        console.print("[*] No IPs found in logs to check.")
+        ips = extract_ips(logs)
+        if ips:
+            console.print(f"\n[*] Checking [bold green]{len(ips)}[/bold green] IPs against AbuseIPDB...")
+            for ip_address in ips:
+                try:
+                    data = check_ip_abuse(
+                        ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
+                    )
+                    print_abuseipdb_report(
+                        ip_address, data, match_indices=ip_to_matches.get(ip_address)
+                    )
+                except Exception as exc:
+                    console.print(f"[red][!] AbuseIPDB error for {ip_address}: {escape(str(exc))}[/red]")
+        else:
+            console.print("[*] No IPs found in logs to check.")
 
 
 if __name__ == "__main__":
