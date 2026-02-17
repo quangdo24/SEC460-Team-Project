@@ -140,29 +140,34 @@ def prompt_user_mode_and_inputs():
     Interactive prompt to choose between:
     1) Kibana query mode (all alerts)
     2) Kibana privilege escalation filter (severity 1 + privilege gain categories)
-    3) Manual AbuseIPDB IP lookup mode
+    3) Kibana RCE detection filter (severity 1-2 + RCE/Command Execution/Injection)
+    4) Manual AbuseIPDB IP lookup mode
 
     Returns: (mode, manual_ips)
-      - mode: "kibana", "kibana_privesc", or "manual"
+      - mode: "kibana", "kibana_privesc", "kibana_rce", or "manual"
     """
     console.print("\n[bold]Select mode:[/bold]")
-    console.print("  [cyan]1)[/cyan] Query Kibana / Elasticsearch (all alerts, then check IPs in AbuseIPDB)")
-    console.print("  [cyan]2)[/cyan] Query Kibana (privilege escalation only: severity 1 + privilege gain)")
-    console.print("  [cyan]3)[/cyan] Manual AbuseIPDB lookup (enter IP address(es))")
+    console.print("  [cyan]1)[/cyan] All Alerts - Recent Suricata alerts with external IPs checked via AbuseIPDB")
+    console.print("  [cyan]2)[/cyan] Privilege Escalation - Severity 1 alerts for privilege gain attempts (past 4h)")
+    console.print("  [cyan]3)[/cyan] RCE Detection - Severity 1-2 alerts for remote code execution attempts (past 24h)")
+    console.print("  [cyan]4)[/cyan] Manual IP Lookup - Check specific IP address reputation via AbuseIPDB")
 
     while True:
-        choice = console.input("Enter [cyan]1[/cyan], [cyan]2[/cyan], or [cyan]3[/cyan]: ").strip()
-        if choice in {"1", "2", "3"}:
+        choice = console.input("Enter [cyan]1[/cyan], [cyan]2[/cyan], [cyan]3[/cyan], or [cyan]4[/cyan]: ").strip()
+        if choice in {"1", "2", "3", "4"}:
             break
-        console.print("[red][!] Please enter 1, 2, or 3.[/red]")
+        console.print("[red][!] Please enter 1, 2, 3, or 4.[/red]")
 
     if choice == "1":
         return "kibana", []
     
     if choice == "2":
         return "kibana_privesc", []
+    
+    if choice == "3":
+        return "kibana_rce", []
 
-    # Option 3: force valid IP input so we never accidentally fall through to Kibana mode
+    # Option 4: force valid IP input so we never accidentally fall through to Kibana mode
     while True:
         ip_text = console.input("Enter IP(s) (comma-separated): ").strip()
         manual_ips = normalize_ips([ip_text])
@@ -198,8 +203,10 @@ query_payload = {
 query_payload_privilege_escalation = {
   "size": 100,
   "_source": [
-    "alert.signature", "alert.category", "src_ip", "dest_ip", "dest_port", "alert.severity",
-    "clientID", "agent.name", "@timestamp", "timestamp"
+    "alert.signature", "@timestamp", "timestamp", "alert.severity", "alert.category",
+    "src_ip", "dest_ip", "dest_port", "src_port", "proto", "clientID",
+    "geoip.src.country_name", "flow.bytes_toclient", "flow.bytes_toserver",
+    "agent.name", "flow_id", "event_type"
   ],
   "query": {
     "bool": {
@@ -210,6 +217,37 @@ query_payload_privilege_escalation = {
           "Attempted Administrator Privilege Gain",
           "Attempted User Privilege Gain"
         ]}}
+      ]
+    }
+  },
+  "sort": [ { "@timestamp": { "order": "desc" } } ]
+}
+
+# RCE Detection Query: severity 1-2 + RCE/Command Injection signatures + past 24 hours
+query_payload_rce = {
+  "size": 100,
+  "_source": [
+    "alert.signature", "@timestamp", "timestamp", "alert.severity", "alert.category",
+    "src_ip", "dest_ip", "dest_port", "src_port", "proto", "clientID",
+    "geoip.src.country_name", "flow.bytes_toclient", "flow.bytes_toserver",
+    "agent.name", "flow_id", "event_type"
+  ],
+  "query": {
+    "bool": {
+      "must": [
+        { "range": { "@timestamp": { "gte": "now-24h" } } },
+        { "terms": { "alert.severity": [1, 2] } },
+        {
+          "bool": {
+            "should": [
+              { "match": { "alert.signature": "RCE" } },
+              { "match_phrase": { "alert.signature": "Remote Code Execution" } },
+              { "match_phrase": { "alert.signature": "Command Execution" } },
+              { "match_phrase": { "alert.signature": "Command Injection" } }
+            ],
+            "minimum_should_match": 1
+          }
+        }
       ]
     }
   },
@@ -343,35 +381,59 @@ def add_to_tree(tree: Tree, data: Any, key: str = "data"):
         tree.add(f"[bold green]{key}[/bold green]: [default]{data!r}[/default]")
 
 
-def print_privesc_hit(idx: int, source: dict):
+def print_privesc_hit(idx: int, source: dict, title: str = "Alert", border_style: str = "red"):
     """
-    Print a simplified privilege escalation alert with only key fields.
+    Print alert with all requested fields in a formatted table.
     """
     alert = source.get("alert") or {}
+    geoip_src = source.get("geoip", {}).get("src", {})
+    flow = source.get("flow", {})
+    agent = source.get("agent", {})
+    
+    # Extract all fields in the requested order
     signature = alert.get("signature", "N/A")
+    timestamp = source.get("@timestamp") or source.get("timestamp", "N/A")
     severity = alert.get("severity", "N/A")
+    category = alert.get("category", "N/A")
     src_ip = source.get("src_ip", "N/A")
     dest_ip = source.get("dest_ip", "N/A")
     dest_port = source.get("dest_port", "N/A")
+    src_port = source.get("src_port", "N/A")
+    proto = source.get("proto", "N/A")
     client_id = source.get("clientID", "N/A")
-    agent_name = source.get("agent", {}).get("name", "N/A")
+    country_name = geoip_src.get("country_name", "N/A")
+    bytes_toclient = flow.get("bytes_toclient", "N/A")
+    bytes_toserver = flow.get("bytes_toserver", "N/A")
+    agent_name = agent.get("name", "N/A")
+    flow_id = source.get("flow_id", "N/A")
+    event_type = source.get("event_type", "N/A")
     
     table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_column(style="bold cyan", width=20)
+    table.add_column(style="bold cyan", width=25)
     table.add_column()
     
+    # Display fields in the requested order
     table.add_row("Alert Signature:", str(signature))
+    table.add_row("Timestamp:", str(timestamp))
+    table.add_row("Severity:", str(severity))
+    table.add_row("Category:", str(category))
     table.add_row("Source IP:", str(src_ip))
     table.add_row("Dest IP:", str(dest_ip))
     table.add_row("Dest Port:", str(dest_port))
-    table.add_row("Severity:", str(severity))
+    table.add_row("Source Port:", str(src_port))
+    table.add_row("Protocol:", str(proto))
     table.add_row("Client ID:", str(client_id))
+    table.add_row("Country:", str(country_name))
+    table.add_row("Bytes to Client:", str(bytes_toclient))
+    table.add_row("Bytes to Server:", str(bytes_toserver))
     table.add_row("Agent Name:", str(agent_name))
+    table.add_row("Flow ID:", str(flow_id))
+    table.add_row("Event Type:", str(event_type))
     
     console.print(Panel(
         table,
-        title=f"[bold]Privilege Escalation Alert #{idx}[/bold]",
-        border_style="red",
+        title=f"[bold]{title} #{idx}[/bold]",
+        border_style=border_style,
         expand=False
     ))
 
@@ -451,7 +513,7 @@ def main():
         try:
             mode, manual_ips = prompt_user_mode_and_inputs()
             max_age_days = ABUSEIPDB_MAX_AGE_DAYS
-            if mode in {"kibana", "kibana_privesc"}:
+            if mode in {"kibana", "kibana_privesc", "kibana_rce"}:
                 kibana_mode = mode
                 manual_ips = []
         except (EOFError, KeyboardInterrupt):
@@ -483,7 +545,13 @@ def main():
     )
 
     # Select query payload based on mode
-    payload = query_payload_privilege_escalation if kibana_mode == "kibana_privesc" else query_payload
+    if kibana_mode == "kibana_privesc":
+        payload = query_payload_privilege_escalation
+    elif kibana_mode == "kibana_rce":
+        payload = query_payload_rce
+    else:
+        payload = query_payload
+    
     logs = get_suricata_logs(wa_kibana["username"], wa_kibana["password"], payload)
     if not logs:
         return
@@ -493,32 +561,31 @@ def main():
     for idx, hit in enumerate(logs, start=1):
         source = hit.get("_source", {})
         if kibana_mode == "kibana_privesc":
-            print_privesc_hit(idx, source)
+            print_privesc_hit(idx, source, title="Privilege Escalation Alert", border_style="red")
+        elif kibana_mode == "kibana_rce":
+            print_privesc_hit(idx, source, title="RCE Detection Alert", border_style="red")
         else:
-            print_suricata_hit(idx, source)
+            print_privesc_hit(idx, source, title="Suricata Alert", border_style="green")
         src_ip = source.get("src_ip")
         if src_ip:
             ip_to_matches.setdefault(src_ip, []).append(idx)
 
-    # Check extracted IPs against AbuseIPDB (skip for privilege escalation mode with internal IPs)
-    if kibana_mode == "kibana_privesc":
-        console.print("\n[*] Skipping AbuseIPDB check for privilege escalation mode (typically internal IPs).")
+    # Check extracted IPs against AbuseIPDB
+    ips = extract_ips(logs)
+    if ips:
+        console.print(f"\n[*] Checking [bold green]{len(ips)}[/bold green] external IPs against AbuseIPDB...")
+        for ip_address in ips:
+            try:
+                data = check_ip_abuse(
+                    ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
+                )
+                print_abuseipdb_report(
+                    ip_address, data, match_indices=ip_to_matches.get(ip_address)
+                )
+            except Exception as exc:
+                console.print(f"[red][!] AbuseIPDB error for {ip_address}: {escape(str(exc))}[/red]")
     else:
-        ips = extract_ips(logs)
-        if ips:
-            console.print(f"\n[*] Checking [bold green]{len(ips)}[/bold green] IPs against AbuseIPDB...")
-            for ip_address in ips:
-                try:
-                    data = check_ip_abuse(
-                        ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
-                    )
-                    print_abuseipdb_report(
-                        ip_address, data, match_indices=ip_to_matches.get(ip_address)
-                    )
-                except Exception as exc:
-                    console.print(f"[red][!] AbuseIPDB error for {ip_address}: {escape(str(exc))}[/red]")
-        else:
-            console.print("[*] No IPs found in logs to check.")
+        console.print("[*] No external IPs found in logs to check.")
 
 
 if __name__ == "__main__":

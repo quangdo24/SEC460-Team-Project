@@ -1,2 +1,4 @@
 secrets/*.json
 !secrets/*.example.json
+# Queries and scan results
+Queries_and_Scan/
