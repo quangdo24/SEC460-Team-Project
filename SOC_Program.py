@@ -41,7 +41,7 @@ DEBUG_PRINT_KIBANA_REQUEST = os.getenv("DEBUG_PRINT_KIBANA_REQUEST", "0") == "1"
 class Logger(object):
     def __init__(self, filename="recentSession.log"):
         self.terminal = sys.stdout
-        self.log = open(filename, "a")
+        self.log = open(filename, "w")
 
     def write(self, message):
         self.terminal.write(message)
