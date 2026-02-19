@@ -38,6 +38,8 @@ ABUSEIPDB_KEY_PATH = Path(
 
 DEBUG_PRINT_KIBANA_REQUEST = os.getenv("DEBUG_PRINT_KIBANA_REQUEST", "0") == "1"
 
+# Implement custom logging function
+# Prints standard output to console and to a log file
 class Logger(object):
     def __init__(self, filename="recentSession.log"):
         self.terminal = sys.stdout
@@ -50,9 +52,6 @@ class Logger(object):
     def flush(self):
         self.terminal.flush()
         self.log.flush()
-
-sys.stdout = Logger("recentSession.log")
-
 
 def load_json_file(path: Path, required_keys: set, example_name: str):
     """Load a JSON secrets file and validate required keys exist."""
@@ -397,6 +396,9 @@ def main():
     print(BANNER)
     args = parse_args()
     manual_ips = normalize_ips(args.ip)
+
+    # Change stdout to Logger object now; avoids printing banner & selection to console
+    sys.stdout = Logger("recentSession.log")
 
     # If user provided no CLI flags, prompt interactively (when possible)
     max_age_days = args.max_age_days
