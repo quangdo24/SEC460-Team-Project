@@ -4,3 +4,6 @@ venv/
 # ignore secrets but allow examples
 secrets/*.json
 !secrets/*.example.json
+
+# ignore recentSession log
+recentSession.log

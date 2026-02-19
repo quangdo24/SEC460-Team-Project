@@ -38,6 +38,21 @@ ABUSEIPDB_KEY_PATH = Path(
 
 DEBUG_PRINT_KIBANA_REQUEST = os.getenv("DEBUG_PRINT_KIBANA_REQUEST", "0") == "1"
 
+class Logger(object):
+    def __init__(self, filename="recentSession.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = Logger("recentSession.log")
+
 
 def load_json_file(path: Path, required_keys: set, example_name: str):
     """Load a JSON secrets file and validate required keys exist."""
