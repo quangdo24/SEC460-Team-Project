@@ -2,6 +2,7 @@ import json
 import os
 import argparse
 import urllib.parse
+import time
 
 import ipaddress
 import sys
@@ -96,6 +97,57 @@ WA_KIBANA_CRED_PATH = Path(
 ABUSEIPDB_KEY_PATH = Path(
     os.getenv("ABUSEIPDB_KEY_PATH", SECRETS_DIR / "abuseipdb.json")
 )
+GEMINI_KEY_PATH = Path(
+    os.getenv("GEMINI_KEY_PATH", SECRETS_DIR / "gemini.json")
+)
+MANTIS_CRED_PATH = Path(
+    os.getenv("MANTIS_CRED_PATH", SECRETS_DIR / "mantis.json")
+)
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+MANTIS_PROJECTS = [
+    {"id": 36, "name": "bainbridge"},
+    {"id": 37, "name": "benton"},
+    {"id": 56, "name": "bitterroot"},
+    {"id": 38, "name": "bonney-lake"},
+    {"id": 7,  "name": "burien"},
+    {"id": 54, "name": "chewelah"},
+    {"id": 9,  "name": "cle-elum"},
+    {"id": 46, "name": "college-place"},
+    {"id": 34, "name": "colville"},
+    {"id": 1,  "name": "covington"},
+    {"id": 61, "name": "dawson"},
+    {"id": 45, "name": "dixon"},
+    {"id": 27, "name": "east-sammamish"},
+    {"id": 22, "name": "east-wenatchee"},
+    {"id": 14, "name": "edgewood"},
+    {"id": 28, "name": "fife"},
+    {"id": 23, "name": "franklin"},
+    {"id": 58, "name": "hawaii"},
+    {"id": 32, "name": "health-first"},
+    {"id": 50, "name": "KIBANA Issues"},
+    {"id": 15, "name": "kittitas"},
+    {"id": 19, "name": "liberty-lake"},
+    {"id": 55, "name": "miles-city"},
+    {"id": 62, "name": "missoula"},
+    {"id": 21, "name": "othello"},
+    {"id": 16, "name": "pacific"},
+    {"id": 60, "name": "polson"},
+    {"id": 43, "name": "port-angeles"},
+    {"id": 17, "name": "port-townsend"},
+    {"id": 26, "name": "poulsbo"},
+    {"id": 59, "name": "sheridan"},
+    {"id": 35, "name": "stevens-pud"},
+    {"id": 52, "name": "Student Help Center"},
+    {"id": 41, "name": "union-gap"},
+    {"id": 40, "name": "washington-county"},
+    {"id": 39, "name": "whitefish"},
+    {"id": 47, "name": "whitefish-city-hall"},
+    {"id": 57, "name": "wsipc"},
+    {"id": 48, "name": "yelm"},
+]
 
 
 DEBUG_PRINT_KIBANA_REQUEST = os.getenv("DEBUG_PRINT_KIBANA_REQUEST", "0") == "1"
@@ -624,6 +676,530 @@ def print_suricata_hit(idx: int, hit: dict):
     print(f"{C.CYAN}{'─' * 70}{C.RESET}")
 
 
+# ── Gemini AI Analysis ────────────────────────────────────────────────────────
+
+def build_gemini_prompt(hit):
+    """Build a minimal prompt for Gemini using only the message field from _source."""
+    source = hit.get("_source", {})
+    message = source.get("message", "")
+
+    prompt = (
+        "You are a SOC analyst. Analyze this Suricata IDS alert and generate an incident report.\n\n"
+        f"**Alert:**\n{message}\n\n"
+    )
+    prompt += (
+        "Based on this data, fill out the following incident report. "
+        "Return ONLY valid JSON (no markdown, no explanation) with this exact structure:\n\n"
+        "{\n"
+        '  "summary": "Brief incident title (e.g. ET MALWARE Emotet C2 Communication from 185.x.x.x)",\n'
+        '  "time_and_date": "timestamp from the alert",\n'
+        '  "destination_ip": "destination IP from the alert",\n'
+        '  "destination_port": "destination port",\n'
+        '  "destination_bytes": "bytes sent to server (from flow data)",\n'
+        '  "source_geo_country_name": "source country from GeoIP data or N/A",\n'
+        '  "source_ip": "source IP from the alert",\n'
+        '  "source_port": "source port",\n'
+        '  "source_bytes": "bytes from client (from flow data)",\n'
+        '  "network_protocol": "protocol/app_proto",\n'
+        '  "client_id": "community_id from the alert or N/A",\n'
+        '  "flow_id": "flow_id from the alert or N/A",\n'
+        '  "event": "Brief description of what attack was attempted (a few words)",\n'
+        '  "what_occurred": "Detailed description of what happened",\n'
+        '  "why_it_happened": "Analysis of why this happened",\n'
+        '  "the_result": "What was the result/impact",\n'
+        '  "key_details": "Important details to note",\n'
+        '  "target_asset": "The target system/asset",\n'
+        '  "security_action": "Recommended security action",\n'
+        '  "additional_information": "TL;DR summary of the scenario"\n'
+        "}\n\n"
+        "IMPORTANT: Return ONLY the JSON object. No markdown formatting, no code fences, no extra text."
+    )
+    return prompt
+
+
+def analyze_with_gemini(hit, api_key, max_retries=5):
+    """Send match data to Gemini API and return the structured analysis dict.
+
+    Retries automatically on 429 (rate-limit) with increasing wait times.
+    Free-tier limits reset per-minute, so longer waits give the best chance.
+    """
+    prompt = build_gemini_prompt(hit)
+
+    url = f"{GEMINI_URL}?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    wait_schedule = [10, 30, 60, 60, 120]  # seconds to wait per retry
+
+    for attempt in range(max_retries):
+        response = requests.post(url, json=payload, timeout=90)
+
+        if response.status_code == 429:
+            wait = wait_schedule[min(attempt, len(wait_schedule) - 1)]
+            print(
+                f"{C.YELLOW}[!] Rate limited by Gemini API (free tier). "
+                f"Waiting {wait}s before retry ({attempt + 1}/{max_retries})...{C.RESET}"
+            )
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+
+        result = response.json()
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+
+        # Strip potential markdown code fences
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
+
+        return json.loads(text)
+
+    # All retries exhausted
+    raise Exception(
+        "Gemini API rate limit (429) — all retries exhausted. "
+        "Wait a few minutes and try again. "
+        "You can also try a different model by setting GEMINI_MODEL env var "
+        "(e.g. set GEMINI_MODEL=gemini-1.5-flash)."
+    )
+
+
+def format_description_text(analysis):
+    """Format the Gemini analysis dict into the Mantis description field text."""
+    sep = "─" * 40
+    lines = [
+        f"{'═' * 50}",
+        f"  NETWORK DETAILS",
+        f"{'─' * 50}",
+        f"  Time and Date      : {analysis.get('time_and_date', 'N/A')}",
+        f"  Network Protocol   : {analysis.get('network_protocol', 'N/A')}",
+        f"  Flow ID            : {analysis.get('flow_id', 'N/A')}",
+        f"  Client ID          : {analysis.get('client_id', 'N/A')}",
+        "",
+        f"  Source IP           : {analysis.get('source_ip', 'N/A')}",
+        f"  Source Port         : {analysis.get('source_port', 'N/A')}",
+        f"  Source Bytes        : {analysis.get('source_bytes', 'N/A')}",
+        f"  Source Country      : {analysis.get('source_geo_country_name', 'N/A')}",
+        "",
+        f"  Destination IP      : {analysis.get('destination_ip', 'N/A')}",
+        f"  Destination Port    : {analysis.get('destination_port', 'N/A')}",
+        f"  Destination Bytes   : {analysis.get('destination_bytes', 'N/A')}",
+        "",
+        f"{'═' * 50}",
+        f"  INCIDENT ANALYSIS",
+        f"{'─' * 50}",
+        f"  Event              : {analysis.get('event', 'N/A')}",
+        f"  Target Asset       : {analysis.get('target_asset', 'N/A')}",
+        "",
+        f"  What Occurred:",
+        f"    {analysis.get('what_occurred', 'N/A')}",
+        "",
+        f"  Why it Happened:",
+        f"    {analysis.get('why_it_happened', 'N/A')}",
+        "",
+        f"  The Result:",
+        f"    {analysis.get('the_result', 'N/A')}",
+        "",
+        f"  Key Details:",
+        f"    {analysis.get('key_details', 'N/A')}",
+        "",
+        f"{'═' * 50}",
+        f"  RECOMMENDED ACTION",
+        f"{'─' * 50}",
+        f"  {analysis.get('security_action', 'N/A')}",
+        f"{'═' * 50}",
+    ]
+    return "\n".join(lines)
+
+
+def display_analysis(analysis):
+    """Display the Gemini AI analysis in a clean, color-coded format."""
+    print(f"\n{C.BOLD}{C.GREEN}{'═' * 70}{C.RESET}")
+    print(f"  {C.BOLD}{C.WHITE}GEMINI AI INCIDENT REPORT{C.RESET}")
+    print(f"{C.GREEN}{'═' * 70}{C.RESET}")
+
+    print(f"\n  {C.BOLD}{C.YELLOW}Summary{C.RESET}")
+    print(f"  {analysis.get('summary', 'N/A')}")
+
+    # ── Network Details ──
+    print(f"\n  {C.BOLD}{C.CYAN}Network Details{C.RESET}")
+    print(f"  {C.CYAN}{'─' * 50}{C.RESET}")
+    net_fields = [
+        ("Time and Date",    "time_and_date"),
+        ("Network Protocol", "network_protocol"),
+        ("Flow ID",          "flow_id"),
+        ("Client ID",        "client_id"),
+    ]
+    for label, key in net_fields:
+        val = analysis.get(key, "N/A")
+        print(f"    {C.WHITE}{label:20s}{C.RESET}  {val}")
+
+    print(f"\n    {C.BOLD}{C.GREEN}Source{C.RESET}")
+    src_fields = [
+        ("IP",      "source_ip"),
+        ("Port",    "source_port"),
+        ("Bytes",   "source_bytes"),
+        ("Country", "source_geo_country_name"),
+    ]
+    for label, key in src_fields:
+        val = analysis.get(key, "N/A")
+        print(f"      {C.WHITE}{label:10s}{C.RESET}  {val}")
+
+    print(f"\n    {C.BOLD}{C.RED}Destination{C.RESET}")
+    dst_fields = [
+        ("IP",    "destination_ip"),
+        ("Port",  "destination_port"),
+        ("Bytes", "destination_bytes"),
+    ]
+    for label, key in dst_fields:
+        val = analysis.get(key, "N/A")
+        print(f"      {C.WHITE}{label:10s}{C.RESET}  {val}")
+
+    # ── Incident Analysis ──
+    print(f"\n  {C.BOLD}{C.MAGENTA}Incident Analysis{C.RESET}")
+    print(f"  {C.MAGENTA}{'─' * 50}{C.RESET}")
+    print(f"    {C.BOLD}{C.RED}Event:{C.RESET}           {analysis.get('event', 'N/A')}")
+    print(f"    {C.BOLD}{C.WHITE}Target Asset:{C.RESET}   {analysis.get('target_asset', 'N/A')}")
+
+    analysis_fields = [
+        ("What Occurred",  "what_occurred"),
+        ("Why it Happened","why_it_happened"),
+        ("The Result",     "the_result"),
+        ("Key Details",    "key_details"),
+    ]
+    for label, key in analysis_fields:
+        val = analysis.get(key, "N/A")
+        print(f"\n    {C.BOLD}{C.WHITE}{label}:{C.RESET}")
+        print(f"    {C.DIM}{val}{C.RESET}")
+
+    # ── Recommended Action ──
+    print(f"\n  {C.BOLD}{C.YELLOW}Recommended Action{C.RESET}")
+    print(f"  {C.YELLOW}{'─' * 50}{C.RESET}")
+    print(f"    {analysis.get('security_action', 'N/A')}")
+
+    # ── Additional Info ──
+    addl = analysis.get("additional_information", "N/A")
+    if addl and addl != "N/A":
+        print(f"\n  {C.BOLD}{C.BLUE}Additional Info{C.RESET}")
+        print(f"  {C.BLUE}{'─' * 50}{C.RESET}")
+        print(f"    {addl}")
+
+    print(f"\n{C.GREEN}{'═' * 70}{C.RESET}")
+
+
+# ── Mantis Ticket Submission ─────────────────────────────────────────────────
+
+def match_hostname_to_project(hostname):
+    """Try to match a hostname from the alert to a Mantis project.
+
+    Uses fuzzy matching: strips trailing digits, normalises separators,
+    and checks if the hostname *starts with* a project name (or vice-versa).
+    Returns the best-matching project dict, or None.
+    """
+    if not hostname:
+        return None
+
+    import re
+    # Normalise: lowercase, strip trailing digits, replace common separators
+    norm = hostname.lower().strip()
+    norm_no_digits = re.sub(r"\d+$", "", norm)          # bonney-lake2 → bonney-lake
+    norm_flat = norm_no_digits.replace("-", "").replace("_", "").replace(" ", "")  # bonneylake
+
+    best = None
+    best_len = 0  # prefer longest match
+
+    for proj in MANTIS_PROJECTS:
+        pname = proj["name"].lower()
+        pflat = pname.replace("-", "").replace("_", "").replace(" ", "")
+
+        # Exact match (after stripping trailing digits)
+        if norm_no_digits == pname or norm_flat == pflat:
+            return proj
+
+        # Hostname starts with project name or vice-versa
+        if norm_flat.startswith(pflat) or pflat.startswith(norm_flat):
+            if len(pflat) > best_len:
+                best = proj
+                best_len = len(pflat)
+
+    return best
+
+
+def prompt_select_project(suggested=None):
+    """Display available Mantis projects and let user select one.
+
+    If *suggested* is provided (a project dict), offer it as the default choice.
+    """
+    if suggested:
+        print(f"\n{C.GREEN}[✓] Auto-detected project from hostname: "
+              f"{C.BOLD}{suggested['name']}{C.RESET}{C.GREEN} (ID: {suggested['id']}){C.RESET}")
+        confirm = input(
+            f"{C.BOLD}Use this project? {C.RESET}{C.DIM}(Y/n): {C.RESET}"
+        ).strip().lower()
+        if confirm in ("", "y", "yes"):
+            print(f"{C.GREEN}[+] Selected: {suggested['name']} (ID: {suggested['id']}){C.RESET}")
+            return suggested
+        print(f"{C.DIM}Showing full project list...{C.RESET}")
+
+    print(f"\n{C.BOLD}{C.WHITE}Select a project (city/location):{C.RESET}")
+
+    cols = 3
+    for i, proj in enumerate(MANTIS_PROJECTS):
+        num = f"{i + 1:>2}"
+        name = proj["name"]
+        end = "\n" if (i + 1) % cols == 0 else ""
+        print(f"  {C.CYAN}{num}){C.RESET} {name:<25s}", end=end)
+    if len(MANTIS_PROJECTS) % cols != 0:
+        print()
+
+    while True:
+        choice = input(f"\n{C.BOLD}Enter project number (1-{len(MANTIS_PROJECTS)}): {C.RESET}").strip()
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(MANTIS_PROJECTS):
+                selected = MANTIS_PROJECTS[idx - 1]
+                print(f"{C.GREEN}[+] Selected: {selected['name']} (ID: {selected['id']}){C.RESET}")
+                return selected
+        except ValueError:
+            pass
+        print(f"{C.YELLOW}[!] Invalid choice. Try again.{C.RESET}")
+
+
+def display_draft_ticket(ticket):
+    """Display the draft Mantis ticket for user review."""
+    vis = ticket.get("view_state", "private")
+    vis_color = C.GREEN if vis == "public" else C.YELLOW
+    vis_icon = "🌐" if vis == "public" else "🔒"
+
+    print(f"\n{C.BOLD}{C.MAGENTA}{'═' * 70}{C.RESET}")
+    print(f"  {C.BOLD}{C.WHITE}DRAFT MANTIS TICKET{C.RESET}")
+    print(f"{C.MAGENTA}{'─' * 70}{C.RESET}")
+
+    # ── Metadata ──
+    print(f"  {C.BOLD}{C.WHITE}Project:{C.RESET}        {C.CYAN}{ticket['project_name']}{C.RESET} {C.DIM}(ID: {ticket['project_id']}){C.RESET}")
+    print(f"  {C.BOLD}{C.WHITE}Visibility:{C.RESET}     {vis_color}{vis_icon}  {vis.upper()}{C.RESET}")
+    print(f"  {C.BOLD}{C.WHITE}Category:{C.RESET}       Bellevue College")
+    print(f"  {C.BOLD}{C.WHITE}Priority:{C.RESET}       normal")
+    print(f"  {C.BOLD}{C.WHITE}Severity:{C.RESET}       minor")
+
+    # ── Summary ──
+    print(f"\n{C.MAGENTA}{'─' * 70}{C.RESET}")
+    print(f"  {C.BOLD}{C.YELLOW}Summary{C.RESET}")
+    print(f"  {ticket['summary']}")
+
+    # ── Description ──
+    print(f"\n{C.MAGENTA}{'─' * 70}{C.RESET}")
+    print(f"  {C.BOLD}{C.CYAN}Description{C.RESET}")
+    for line in ticket["description"].split("\n"):
+        print(f"  {line}")
+
+    # ── Steps to Reproduce (Kibana link) ──
+    print(f"\n{C.MAGENTA}{'─' * 70}{C.RESET}")
+    print(f"  {C.BOLD}{C.BLUE}Steps to Reproduce{C.RESET}")
+    print(f"  {ticket['steps_to_reproduce']}")
+
+    # ── Additional Info ──
+    addl = ticket.get("additional_information", "")
+    if addl:
+        print(f"\n{C.MAGENTA}{'─' * 70}{C.RESET}")
+        print(f"  {C.BOLD}{C.GREEN}Additional Info{C.RESET}")
+        print(f"  {addl}")
+
+    print(f"{C.MAGENTA}{'═' * 70}{C.RESET}")
+
+
+def prompt_edit_ticket(ticket):
+    """Allow user to review and edit the draft ticket. Returns ticket dict or None if cancelled."""
+    while True:
+        display_draft_ticket(ticket)
+
+        vis = ticket.get("view_state", "private")
+        toggle_label = "public" if vis == "private" else "private"
+
+        print(f"\n  {C.BOLD}{C.WHITE}Actions:{C.RESET}")
+        print(f"  {C.CYAN}{'─' * 40}{C.RESET}")
+        print(f"    {C.GREEN}1){C.RESET}  {C.GREEN}Submit ticket{C.RESET}")
+        print(f"    {C.CYAN}2){C.RESET}  Edit summary")
+        print(f"    {C.CYAN}3){C.RESET}  Edit description")
+        print(f"    {C.CYAN}4){C.RESET}  Edit steps to reproduce")
+        print(f"    {C.CYAN}5){C.RESET}  Edit additional information")
+        print(f"    {C.CYAN}6){C.RESET}  Change project")
+        print(f"    {C.CYAN}7){C.RESET}  Toggle visibility → {C.YELLOW}{toggle_label}{C.RESET}")
+        print(f"    {C.RED}8){C.RESET}  {C.RED}Cancel{C.RESET}")
+
+        choice = input(f"\n{C.BOLD}  Choose an option (1-8): {C.RESET}").strip()
+
+        if choice == "1":
+            return ticket
+        elif choice == "2":
+            new_val = input(f"{C.BOLD}Enter new summary: {C.RESET}").strip()
+            if new_val:
+                ticket["summary"] = new_val
+        elif choice == "3":
+            print(f"{C.DIM}Enter new description (multi-line). Type 'END' on a new line when done:{C.RESET}")
+            lines = []
+            while True:
+                line = input()
+                if line.strip().upper() == "END":
+                    break
+                lines.append(line)
+            if lines:
+                ticket["description"] = "\n".join(lines)
+        elif choice == "4":
+            new_val = input(f"{C.BOLD}Enter new steps to reproduce: {C.RESET}").strip()
+            if new_val:
+                ticket["steps_to_reproduce"] = new_val
+        elif choice == "5":
+            new_val = input(f"{C.BOLD}Enter new additional information: {C.RESET}").strip()
+            if new_val:
+                ticket["additional_information"] = new_val
+        elif choice == "6":
+            proj = prompt_select_project()
+            ticket["project_id"] = proj["id"]
+            ticket["project_name"] = proj["name"]
+        elif choice == "7":
+            ticket["view_state"] = toggle_label
+            print(f"{C.GREEN}[+] Visibility set to: {C.BOLD}{toggle_label.upper()}{C.RESET}")
+        elif choice == "8":
+            return None
+        else:
+            print(f"{C.YELLOW}[!] Invalid choice.{C.RESET}")
+
+
+def submit_mantis_ticket(ticket, api_url, api_token):
+    """Submit a ticket to Mantis via REST API and return the response JSON."""
+    url = f"{api_url}/api/rest/issues/"
+    headers = {
+        "Authorization": api_token,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "summary": ticket["summary"],
+        "description": ticket["description"],
+        "steps_to_reproduce": ticket["steps_to_reproduce"],
+        "additional_information": ticket["additional_information"],
+        "project": {"id": ticket["project_id"]},
+        "category": {"name": "Bellevue College"},
+        "priority": {"name": "normal"},
+        "severity": {"name": "minor"},
+        "reproducibility": {"name": "have not tried"},
+        "view_state": {"name": ticket.get("view_state", "private")},
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# ── Gemini + Mantis Combined Flow ────────────────────────────────────────────
+
+def gemini_and_mantis_flow(hits, ip_to_abuseipdb):
+    """After Kibana results, offer Gemini AI analysis and Mantis ticket submission."""
+    while True:
+        print(f"\n{C.BOLD}{C.WHITE}Would you like to analyze a match with Gemini AI?{C.RESET} ", end="")
+        choice = input(f"{C.DIM}(y/n): {C.RESET}").strip().lower()
+        if choice != "y":
+            break
+
+        # Load Gemini API key
+        try:
+            gemini_secrets = load_json_file(GEMINI_KEY_PATH, {"api_key"}, "gemini.example.json")
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"{C.RED}[!] {exc}{C.RESET}")
+            break
+
+        # Select match
+        while True:
+            match_input = input(
+                f"{C.BOLD}Enter match number (1-{len(hits)}): {C.RESET}"
+            ).strip()
+            try:
+                match_idx = int(match_input)
+                if 1 <= match_idx <= len(hits):
+                    break
+            except ValueError:
+                pass
+            print(f"{C.YELLOW}[!] Invalid match number. Try again.{C.RESET}")
+
+        hit = hits[match_idx - 1]
+
+        # Send to Gemini
+        print(f"{C.CYAN}[*] Sending match {match_idx} to Gemini AI for analysis...{C.RESET}")
+        try:
+            analysis = analyze_with_gemini(hit, gemini_secrets["api_key"])
+            display_analysis(analysis)
+        except Exception as exc:
+            print(f"{C.RED}[!] Gemini API error: {exc}{C.RESET}")
+            continue
+
+        # Offer Mantis submission
+        print(f"\n{C.BOLD}{C.WHITE}Would you like to submit this as a Mantis ticket?{C.RESET} ", end="")
+        mantis_choice = input(f"{C.DIM}(y/n): {C.RESET}").strip().lower()
+        if mantis_choice != "y":
+            continue
+
+        # Load Mantis credentials
+        try:
+            mantis_creds = load_json_file(
+                MANTIS_CRED_PATH, {"api_url", "api_token"}, "mantis.example.json"
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"{C.RED}[!] {exc}{C.RESET}")
+            continue
+
+        # Auto-detect project from hostname in the selected hit
+        hit_hostname = (hit.get("_source", {}).get("host") or {}).get("hostname")
+        suggested_project = match_hostname_to_project(hit_hostname)
+        project = prompt_select_project(suggested=suggested_project)
+
+        # Get Kibana permalink
+        kibana_link = input(
+            f"\n{C.BOLD}Enter Kibana permalink{C.RESET} "
+            f"{C.DIM}(https://wa-kibana.cyberrangepoulsbo.com/goto/...): {C.RESET}"
+        ).strip()
+
+        # Ticket visibility
+        print(f"\n  {C.CYAN}1){C.RESET} {C.YELLOW}🔒 Private{C.RESET} {C.DIM}(default — only your team can see it){C.RESET}")
+        print(f"  {C.CYAN}2){C.RESET} {C.GREEN}🌐 Public{C.RESET}  {C.DIM}(visible to all MantisBT users){C.RESET}")
+        vis_choice = input(f"{C.BOLD}Visibility (1/2, Enter for private): {C.RESET}").strip()
+        view_state = "public" if vis_choice == "2" else "private"
+
+        # Build draft ticket
+        ticket = {
+            "summary": analysis.get("summary", "Incident Report"),
+            "description": format_description_text(analysis),
+            "steps_to_reproduce": kibana_link,
+            "additional_information": analysis.get("additional_information", ""),
+            "project_id": project["id"],
+            "project_name": project["name"],
+            "view_state": view_state,
+        }
+
+        # Let user review / edit
+        final_ticket = prompt_edit_ticket(ticket)
+        if final_ticket is None:
+            print(f"{C.YELLOW}[*] Ticket submission cancelled.{C.RESET}")
+            continue
+
+        # Submit to Mantis
+        print(f"{C.CYAN}[*] Submitting ticket to Mantis...{C.RESET}")
+        try:
+            result = submit_mantis_ticket(
+                final_ticket, mantis_creds["api_url"], mantis_creds["api_token"]
+            )
+            ticket_id = result.get("issue", {}).get("id", "unknown")
+            print(f"{C.GREEN}{C.BOLD}[+] Ticket submitted successfully! Ticket ID: #{ticket_id}{C.RESET}")
+        except Exception as exc:
+            print(f"{C.RED}[!] Mantis API error: {exc}{C.RESET}")
+
+
 # Entrypoint: interactive selection, Kibana query, and/or manual AbuseIPDB checks.
 def main():
     """Program entrypoint: interactive mode selection, Kibana query, and/or AbuseIPDB checks."""
@@ -703,6 +1279,7 @@ def main():
                 })
 
         ips = extract_ips(logs)
+        ip_to_abuseipdb = {}
         if ips:
             print(f"\n{C.CYAN}[*] Checking {len(ips)} unique public IP(s) against AbuseIPDB...{C.RESET}")
             for ip_address in ips:
@@ -710,6 +1287,7 @@ def main():
                     data = check_ip_abuse(
                         ip_address, abuseipdb["api_key"], max_age_days, abuse_verbose
                     )
+                    ip_to_abuseipdb[ip_address] = data
                     print_abuseipdb_report(
                         ip_address, data, match_context=ip_to_context.get(ip_address)
                     )
@@ -717,6 +1295,12 @@ def main():
                     print(f"{C.RED}[!] AbuseIPDB error for {ip_address}: {exc}{C.RESET}")
         else:
             print(f"{C.YELLOW}[*] No public IPs found in results to check.{C.RESET}")
+
+        # Offer Gemini AI analysis and Mantis ticket submission
+        try:
+            gemini_and_mantis_flow(logs, ip_to_abuseipdb)
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{C.YELLOW}[*] Cancelled.{C.RESET}")
 
 
 if __name__ == "__main__":
