@@ -3,6 +3,8 @@ import os
 import argparse
 import urllib.parse
 import time
+import subprocess
+import tempfile
 
 import ipaddress
 import sys
@@ -106,6 +108,7 @@ MANTIS_CRED_PATH = Path(
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompts" / "gemini_prompt.md"
 
 MANTIS_PROJECTS = [
     {"id": 36, "name": "bainbridge"},
@@ -676,54 +679,120 @@ def print_suricata_hit(idx: int, hit: dict):
     print(f"{C.CYAN}{'─' * 70}{C.RESET}")
 
 
+# ── Editor + Data Preview Helpers ─────────────────────────────────────────────
+
+def open_in_editor(text, suffix=".txt"):
+    """Open text in the user's default text editor and return the edited result."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=suffix, delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(text)
+        tmp_path = tmp.name
+
+    try:
+        if sys.platform == "win32":
+            editor = os.getenv("EDITOR", "notepad")
+        else:
+            editor = os.getenv("EDITOR", "nano")
+        subprocess.call([editor, tmp_path])
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def pretty_message(message):
+    """Try to pretty-print the message if it's JSON, otherwise return as-is."""
+    try:
+        parsed = json.loads(message)
+        return json.dumps(parsed, indent=2, default=str)
+    except (json.JSONDecodeError, TypeError):
+        return message
+
+
+def preview_and_cleanse_data(message):
+    """Display the data that will be sent to Gemini and let the user cleanse it.
+
+    Returns the (possibly edited) message string, or None if the user cancels.
+    Loops until the user confirms the final version or cancels.
+    """
+    current = pretty_message(message)
+
+    while True:
+        print(f"\n{C.BOLD}{C.WHITE}Data to be sent to Gemini AI:{C.RESET}")
+        print(f"{C.CYAN}{'─' * 70}{C.RESET}")
+        for line in current.split("\n"):
+            print(f"  {C.DIM}{line}{C.RESET}")
+        print(f"{C.CYAN}{'─' * 70}{C.RESET}")
+
+        print(f"\n  {C.GREEN}1){C.RESET} Confirm and send")
+        print(f"  {C.CYAN}2){C.RESET} Edit / cleanse in text editor")
+        print(f"  {C.RED}3){C.RESET} Cancel")
+
+        choice = input(f"\n{C.BOLD}  Choose (1-3): {C.RESET}").strip()
+
+        if choice == "1":
+            return current
+        elif choice == "2":
+            edited = open_in_editor(current)
+            if edited.strip():
+                current = edited.strip()
+                print(f"{C.GREEN}[+] Data updated from editor. Showing updated preview...{C.RESET}")
+            else:
+                print(f"{C.YELLOW}[!] Editor returned empty — keeping previous version.{C.RESET}")
+        elif choice == "3":
+            return None
+        else:
+            print(f"{C.YELLOW}[!] Invalid choice.{C.RESET}")
+
+
+def edit_text_field(current_value, field_name):
+    """Prompt the user to edit a text field inline or in a text editor."""
+    print(f"\n  {C.CYAN}1){C.RESET} Type new value")
+    print(f"  {C.CYAN}2){C.RESET} Open in text editor")
+    print(f"  {C.CYAN}3){C.RESET} Keep current")
+
+    choice = input(f"{C.BOLD}  Choose (1-3): {C.RESET}").strip()
+
+    if choice == "1":
+        print(f"{C.DIM}Type new {field_name} (multi-line). Enter 'END' on its own line when done:{C.RESET}")
+        lines = []
+        while True:
+            line = input()
+            if line.strip().upper() == "END":
+                break
+            lines.append(line)
+        return "\n".join(lines) if lines else current_value
+    elif choice == "2":
+        edited = open_in_editor(current_value)
+        return edited.strip() if edited.strip() else current_value
+    else:
+        return current_value
+
+
 # ── Gemini AI Analysis ────────────────────────────────────────────────────────
 
-def build_gemini_prompt(hit):
-    """Build a minimal prompt for Gemini using only the message field from _source."""
-    source = hit.get("_source", {})
-    message = source.get("message", "")
-
-    prompt = (
-        "You are a SOC analyst. Analyze this Suricata IDS alert and generate an incident report.\n\n"
-        f"**Alert:**\n{message}\n\n"
-    )
-    prompt += (
-        "Based on this data, fill out the following incident report. "
-        "Return ONLY valid JSON (no markdown, no explanation) with this exact structure:\n\n"
-        "{\n"
-        '  "summary": "Brief incident title (e.g. ET MALWARE Emotet C2 Communication from 185.x.x.x)",\n'
-        '  "time_and_date": "timestamp from the alert",\n'
-        '  "destination_ip": "destination IP from the alert",\n'
-        '  "destination_port": "destination port",\n'
-        '  "destination_bytes": "bytes sent to server (from flow data)",\n'
-        '  "source_geo_country_name": "source country from GeoIP data or N/A",\n'
-        '  "source_ip": "source IP from the alert",\n'
-        '  "source_port": "source port",\n'
-        '  "source_bytes": "bytes from client (from flow data)",\n'
-        '  "network_protocol": "protocol/app_proto",\n'
-        '  "client_id": "community_id from the alert or N/A",\n'
-        '  "flow_id": "flow_id from the alert or N/A",\n'
-        '  "event": "Brief description of what attack was attempted (a few words)",\n'
-        '  "what_occurred": "Detailed description of what happened",\n'
-        '  "why_it_happened": "Analysis of why this happened",\n'
-        '  "the_result": "What was the result/impact",\n'
-        '  "key_details": "Important details to note",\n'
-        '  "target_asset": "The target system/asset",\n'
-        '  "security_action": "Recommended security action",\n'
-        '  "additional_information": "TL;DR summary of the scenario"\n'
-        "}\n\n"
-        "IMPORTANT: Return ONLY the JSON object. No markdown formatting, no code fences, no extra text."
-    )
-    return prompt
+def build_gemini_prompt(message_text):
+    """Build the Gemini prompt by loading the template from prompts/gemini_prompt.md."""
+    if not PROMPT_TEMPLATE_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing prompt template: {PROMPT_TEMPLATE_PATH}. "
+            "Please ensure prompts/gemini_prompt.md exists."
+        )
+    template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return template.replace("{ALERT_MESSAGE}", message_text)
 
 
-def analyze_with_gemini(hit, api_key, max_retries=5):
-    """Send match data to Gemini API and return the structured analysis dict.
+def analyze_with_gemini(message_text, api_key, max_retries=5):
+    """Send alert message to Gemini API and return the structured analysis dict.
 
     Retries automatically on 429 (rate-limit) with increasing wait times.
     Free-tier limits reset per-minute, so longer waits give the best chance.
     """
-    prompt = build_gemini_prompt(hit)
+    prompt = build_gemini_prompt(message_text)
 
     url = f"{GEMINI_URL}?key={api_key}"
     payload = {
@@ -1042,23 +1111,17 @@ def prompt_edit_ticket(ticket):
             if new_val:
                 ticket["summary"] = new_val
         elif choice == "3":
-            print(f"{C.DIM}Enter new description (multi-line). Type 'END' on a new line when done:{C.RESET}")
-            lines = []
-            while True:
-                line = input()
-                if line.strip().upper() == "END":
-                    break
-                lines.append(line)
-            if lines:
-                ticket["description"] = "\n".join(lines)
+            ticket["description"] = edit_text_field(
+                ticket["description"], "description"
+            )
         elif choice == "4":
             new_val = input(f"{C.BOLD}Enter new steps to reproduce: {C.RESET}").strip()
             if new_val:
                 ticket["steps_to_reproduce"] = new_val
         elif choice == "5":
-            new_val = input(f"{C.BOLD}Enter new additional information: {C.RESET}").strip()
-            if new_val:
-                ticket["additional_information"] = new_val
+            ticket["additional_information"] = edit_text_field(
+                ticket["additional_information"], "additional information"
+            )
         elif choice == "6":
             proj = prompt_select_project()
             ticket["project_id"] = proj["id"]
@@ -1129,11 +1192,22 @@ def gemini_and_mantis_flow(hits, ip_to_abuseipdb):
             print(f"{C.YELLOW}[!] Invalid match number. Try again.{C.RESET}")
 
         hit = hits[match_idx - 1]
+        message = hit.get("_source", {}).get("message", "")
+
+        if not message:
+            print(f"{C.YELLOW}[!] Match {match_idx} has no 'message' field in _source. Skipping.{C.RESET}")
+            continue
+
+        # Preview data and let user cleanse before sending
+        cleansed = preview_and_cleanse_data(message)
+        if cleansed is None:
+            print(f"{C.YELLOW}[*] Cancelled.{C.RESET}")
+            continue
 
         # Send to Gemini
         print(f"{C.CYAN}[*] Sending match {match_idx} to Gemini AI for analysis...{C.RESET}")
         try:
-            analysis = analyze_with_gemini(hit, gemini_secrets["api_key"])
+            analysis = analyze_with_gemini(cleansed, gemini_secrets["api_key"])
             display_analysis(analysis)
         except Exception as exc:
             print(f"{C.RED}[!] Gemini API error: {exc}{C.RESET}")
